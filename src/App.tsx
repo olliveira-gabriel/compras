@@ -42,6 +42,7 @@ function Dash() {
 
 function Crud({ table, title, fields }: any) {
   const [rows, setRows] = useState<any[]>([]), [f, setF] = useState<any>({}), [q, setQ] = useState(''), [sups, setSups] = useState<any[]>([])
+  const [importRows, setImportRows] = useState<any[]>([]), [importName, setImportName] = useState(''), [importing, setImporting] = useState(false)
   const load = useCallback(async () => { const { data } = await sb.from(table).select('*').order(fields[0].k); setRows(data || []) }, [table])
   useEffect(() => { load(); if (table === 'products') sb.from('suppliers').select('id,name').eq('active', true).order('name').then(r => setSups(r.data || [])) }, [load])
   const edit = async (r: any) => {
@@ -62,8 +63,73 @@ function Crud({ table, title, fields }: any) {
     }
     setF({}); load()
   }
+  const norm = (value: any) => String(value ?? '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]/g, '')
+  const pickColumn = (row: any, aliases: string[]) => {
+    const keys = Object.keys(row)
+    const key = keys.find(k => aliases.includes(norm(k))) || keys.find(k => aliases.some(a => norm(k).startsWith(a)))
+    return key ? String(row[key] ?? '').trim() : ''
+  }
+  const loadImportFile = async (file?: File) => {
+    if (!file) return
+    try {
+      const { read, utils } = await import('xlsx')
+      const workbook = read(await file.arrayBuffer(), { type: 'array' })
+      const sheet = workbook.Sheets[workbook.SheetNames[0]]
+      if (!sheet) throw new Error('Não encontrei uma aba com dados no arquivo.')
+      const source = utils.sheet_to_json<any>(sheet, { defval: '', raw: false })
+      if (!source.length) throw new Error('O arquivo não tem linhas de produtos abaixo do cabeçalho.')
+      const existing = new Set(rows.map(r => norm(r.sku)))
+      const seen = new Set<string>()
+      const parsed = source.map((row, index) => {
+        const sku = pickColumn(row, ['sku', 'codigo', 'codigosku', 'codigoproduto', 'referencia'])
+        const description = pickColumn(row, ['descricao', 'produto', 'nome', 'nomeproduto'])
+        const category = pickColumn(row, ['categoria', 'category', 'familia', 'grupo'])
+        const supplierText = pickColumn(row, ['fornecedor', 'fornecedores', 'supplier', 'suppliers'])
+        const issues: string[] = []
+        if (!sku) issues.push('Código/SKU vazio')
+        if (!description) issues.push('Descrição vazia')
+        const normalizedSku = norm(sku)
+        if (normalizedSku && existing.has(normalizedSku)) issues.push('Código já cadastrado')
+        if (normalizedSku && seen.has(normalizedSku)) issues.push('Código repetido no arquivo')
+        if (normalizedSku) seen.add(normalizedSku)
+        const supplierNames = supplierText ? supplierText.split(/[;|]/).map((x: string) => x.trim()).filter(Boolean) : []
+        const supplierIds: string[] = []
+        supplierNames.forEach((supplierName: string) => {
+          const supplier = sups.find(x => norm(x.name) === norm(supplierName))
+          if (supplier) supplierIds.push(supplier.id)
+          else issues.push(`Fornecedor não encontrado: ${supplierName}`)
+        })
+        return { rowNumber: index + 2, sku, description, category, supplierIds: [...new Set(supplierIds)], issues }
+      })
+      setImportName(file.name)
+      setImportRows(parsed)
+    } catch (error: any) { alert(error.message || 'Não foi possível ler esse arquivo.') }
+  }
+  const importProducts = async () => {
+    const valid = importRows.filter(r => !r.issues.length)
+    if (!valid.length || importing) return
+    setImporting(true)
+    const result = await sb.from('products').insert(valid.map(({ sku, description, category }) => ({ sku, description, category: category || null }))).select('id,sku')
+    if (result.error) { alert(result.error.message); setImporting(false); return }
+    const skuToId = new Map((result.data || []).map((p: any) => [norm(p.sku), p.id]))
+    const links = valid.flatMap(r => r.supplierIds.map((supplier_id: string) => ({ product_id: skuToId.get(norm(r.sku)), supplier_id })))
+    let supplierError = ''
+    if (links.length) {
+      const { error } = await sb.from('product_suppliers').insert(links)
+      if (error) supplierError = error.message
+    }
+    alert(`${result.data?.length || 0} produto(s) importado(s).${supplierError ? ` Os vínculos com fornecedores não foram salvos: ${supplierError}` : ''}`)
+    setImportRows([]); setImportName(''); setImporting(false); load()
+  }
+  const downloadTemplate = () => {
+    const content = '\ufeffCódigo/SKU;Descrição;Categoria;Fornecedores\r\n001;Café em pó 500 g;Mercearia;\r\n'
+    const url = URL.createObjectURL(new Blob([content], { type: 'text/csv;charset=utf-8' }))
+    const a = document.createElement('a'); a.href = url; a.download = 'modelo-produtos.csv'; a.click(); URL.revokeObjectURL(url)
+  }
   const vis = rows.filter(r => JSON.stringify(Object.values(r)).toLowerCase().includes(q.toLowerCase()))
-  return <div><h2>{title}</h2>
+  return <div><div className="products-heading"><h2>{title}</h2>{table === 'products' && <div className="import-actions"><label className="import-file-button">Importar Excel ou CSV<input type="file" accept=".xlsx,.xls,.csv" onChange={e => { loadImportFile(e.target.files?.[0]); e.currentTarget.value = '' }} /></label><button type="button" onClick={downloadTemplate}>Baixar modelo CSV</button></div>}</div>
+    {table === 'products' && <p className="import-hint">Colunas aceitas: Código/SKU e Descrição (obrigatórias), Categoria e Fornecedores (opcionais). Use nomes de fornecedores já cadastrados; separe vários com ; ou |.</p>}
+    {table === 'products' && importRows.length > 0 && <section className="card import-preview"><div className="import-preview-heading"><div><h3>Prévia da importação</h3><p>{importName} · {importRows.filter(r => !r.issues.length).length} pronto(s) para importar · {importRows.filter(r => r.issues.length).length} com problema</p></div><button type="button" onClick={() => { setImportRows([]); setImportName('') }}>Cancelar</button></div><div className="tw"><table><thead><tr><th>Linha</th><th>Código/SKU</th><th>Descrição</th><th>Categoria</th><th>Fornecedores</th><th>Validação</th></tr></thead><tbody>{importRows.slice(0, 12).map(r => <tr key={r.rowNumber}><td>{r.rowNumber}</td><td>{r.sku || '—'}</td><td>{r.description || '—'}</td><td>{r.category || '—'}</td><td>{r.supplierIds.length || '—'}</td><td className={r.issues.length ? 'import-error' : 'import-valid'}>{r.issues.join('; ') || 'Pronto'}</td></tr>)}</tbody></table></div>{importRows.length > 12 && <p className="import-more">Mostrando 12 de {importRows.length} linhas.</p>}<div className="import-preview-footer"><span>Linhas com erro serão ignoradas. Códigos já cadastrados não serão alterados.</span><button className="pri" type="button" disabled={importing || !importRows.some(r => !r.issues.length)} onClick={importProducts}>{importing ? 'Importando…' : `Importar ${importRows.filter(r => !r.issues.length).length} produto(s)`}</button></div></section>}
     <div className="card"><div className="row">{fields.map((fl: any) => <input key={fl.k} placeholder={fl.l + (fl.req ? ' *' : '')} value={f[fl.k] ?? ''} onChange={e => setF({ ...f, [fl.k]: e.target.value })} />)}</div>
       {table === 'products' && <div className="row"><b>Fornecedores:</b>{sups.map(s => <label key={s.id}><input type="checkbox" checked={(f._sup || []).includes(s.id)} onChange={e => setF({ ...f, _sup: e.target.checked ? [...(f._sup || []), s.id] : (f._sup || []).filter((x: string) => x !== s.id) })} /> {s.name}</label>)}</div>}
       <button className="pri" onClick={save}>{f.id ? 'Salvar alterações' : 'Adicionar'}</button> {f.id && <button onClick={() => setF({})}>Cancelar</button>}</div>
@@ -74,15 +140,34 @@ function Crud({ table, title, fields }: any) {
 }
 
 function Lists() {
-  const [ls, setLs] = useState<any[]>([]), [name, setName] = useState(''), [cur, setCur] = useState<any>(null)
+  const [ls, setLs] = useState<any[]>([]), [name, setName] = useState(''), [cur, setCur] = useState<any>(null), [saving, setSaving] = useState(false)
   const load = async () => { const { data } = await sb.from('purchase_lists').select('*').order('last_activity_at', { ascending: false }); setLs(data || []) }
   useEffect(() => { load() }, [])
   if (cur) return <Detail l={cur} back={() => { setCur(null); load() }} />
-  return <div><h2>Listas de compras</h2>
-    <div className="row"><input placeholder="Nome da nova lista" value={name} onChange={e => setName(e.target.value)} />
-      <button className="pri" onClick={async () => { if (name.trim() && await run(sb.from('purchase_lists').insert({ name: name.trim() }))) { setName(''); load() } }}>Criar lista</button></div>
-    <div className="tw"><table><thead><tr><th>Código</th><th>Nome</th><th>Criada em</th><th>Última movimentação</th><th>Status</th></tr></thead>
-      <tbody>{ls.map(l => <tr key={l.id} className="c" onClick={() => setCur(l)}><td>{l.code}</td><td>{l.name}</td><td>{dt(l.created_at)}</td><td>{dt(l.last_activity_at)}</td><td><Tag s={l.status} /></td></tr>)}</tbody></table></div></div>
+  const create = async (e: any) => {
+    e.preventDefault()
+    const value = name.trim()
+    if (!value || saving) return
+    setSaving(true)
+    if (await run(sb.from('purchase_lists').insert({ name: value }))) { setName(''); await load() }
+    setSaving(false)
+  }
+  return <section className="lists-page">
+    <header className="lists-heading"><div><span className="eyebrow">COMPRAS</span><h2>Listas de compras</h2><p>Organize os itens que precisam ser comprados e acompanhe cada lista até virar pedido.</p></div><span className="lists-count">{ls.length} {ls.length === 1 ? 'lista' : 'listas'}</span></header>
+    <form className="create-list card" onSubmit={create}>
+      <div className="create-list-copy"><span className="create-list-icon">＋</span><div><h3>Comece uma nova lista</h3><p>Dê um nome fácil de reconhecer, como “Reposição da loja Centro”.</p></div></div>
+      <label className="create-list-field" htmlFor="new-list-name">Nome da lista</label>
+      <div className="create-list-controls"><input id="new-list-name" autoComplete="off" placeholder="Ex.: Compras da semana" value={name} onChange={e => setName(e.target.value)} />
+        <button className="pri" type="submit" disabled={!name.trim() || saving}>{saving ? 'Criando…' : 'Criar lista'}</button></div>
+    </form>
+    <div className="lists-section-heading"><div><h3>Suas listas</h3><p>Selecione uma lista para adicionar produtos ou acompanhar o andamento.</p></div></div>
+    {ls.length ? <div className="list-cards">{ls.map(l => <button type="button" className="list-card" key={l.id} onClick={() => setCur(l)}>
+      <span className="list-card-top"><span className="list-code">Lista #{l.code}</span><Tag s={l.status} /></span>
+      <strong className="list-card-name">{l.name}</strong>
+      <span className="list-card-date">Atualizada em {dt(l.last_activity_at || l.created_at)}</span>
+      <span className="list-card-open">Abrir lista <span aria-hidden="true">→</span></span>
+    </button>)}</div> : <div className="lists-empty card"><span className="empty-icon">☷</span><h3>Nenhuma lista por aqui ainda</h3><p>Crie sua primeira lista acima para começar a organizar uma compra.</p></div>}
+  </section>
 }
 
 function Detail({ l, back }: any) {
@@ -119,30 +204,34 @@ function Detail({ l, back }: any) {
     if (error) return alert(error.message)
     alert(data + ' pedido(s) gerado(s).'); setPrev(false); load()
   }
-  return <div><div className="row"><button onClick={back}>← Voltar</button><h2 style={{ margin: 0 }}>{list.code} · {list.name}</h2><Tag s={list.status} /></div>
-    {open && <div className="card"><div className="row">
-      <input type="date" value={f.entry_date} onChange={e => setF({ ...f, entry_date: e.target.value })} />
-      <input placeholder="Buscar produto (código/descrição)" value={s} onChange={e => setS(e.target.value)} />
-      <select value={f.product_id} onChange={e => setF({ ...f, product_id: e.target.value, supplier_id: '' })}><option value="">Produto *</option>{prods.slice(0, 200).map(p => <option key={p.id} value={p.id}>{p.sku} - {p.description}</option>)}</select>
-      <select value={f.supplier_id} onChange={e => setF({ ...f, supplier_id: e.target.value })}><option value="">Fornecedor *</option>{sups.map((x: any) => <option key={x.id} value={x.id}>{x.name}</option>)}</select>
-      <select value={f.store_id} onChange={e => setF({ ...f, store_id: e.target.value })}><option value="">Loja *</option>{st.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}</select>
-      <input type="number" min="1" placeholder="Qtd *" style={{ width: 80 }} value={f.quantity} onChange={e => setF({ ...f, quantity: e.target.value })} />
-      <input type="number" min="0" step="0.01" placeholder="Preço unit. *" style={{ width: 110 }} value={f.unit_price} onChange={e => setF({ ...f, unit_price: e.target.value })} />
-      <input placeholder="Observação" value={f.notes ?? ''} onChange={e => setF({ ...f, notes: e.target.value })} />
-      <button className="pri" onClick={save}>{f.id ? 'Salvar' : 'Adicionar'}</button>{f.id && <button onClick={() => setF(blank)}>Cancelar</button>}</div></div>}
-    <div className="row"><input placeholder="Filtrar produto" value={fp} onChange={e => setFp(e.target.value)} />
+  return <div className="list-detail"><div className="detail-heading"><button onClick={back}>← Voltar às listas</button><div><span className="eyebrow">LISTA DE COMPRAS</span><h2>{list.code} · {list.name}</h2></div><Tag s={list.status} /></div>
+    {open && <section className="card entry-panel"><div className="entry-panel-heading"><div><h3>{f.id ? 'Editar item' : 'Adicionar itens à lista'}</h3><p>Preencha os dados do produto. Os campos com * são obrigatórios.</p></div></div>
+      <div className="entry-grid">
+        <label className="entry-field"><span>Data da compra *</span><input type="date" value={f.entry_date} onChange={e => setF({ ...f, entry_date: e.target.value })} /></label>
+        <label className="entry-field entry-product-search"><span>Buscar produto</span><input placeholder="Digite o código ou nome" value={s} onChange={e => setS(e.target.value)} /></label>
+        <label className="entry-field entry-product-select"><span>Produto *</span><select value={f.product_id} onChange={e => setF({ ...f, product_id: e.target.value, supplier_id: '' })}><option value="">Selecione um produto</option>{prods.slice(0, 200).map(p => <option key={p.id} value={p.id}>{p.sku} - {p.description}</option>)}</select></label>
+        <label className="entry-field"><span>Fornecedor *</span><select value={f.supplier_id} onChange={e => setF({ ...f, supplier_id: e.target.value })}><option value="">Selecione um fornecedor</option>{sups.map((x: any) => <option key={x.id} value={x.id}>{x.name}</option>)}</select></label>
+        <label className="entry-field"><span>Loja *</span><select value={f.store_id} onChange={e => setF({ ...f, store_id: e.target.value })}><option value="">Selecione uma loja</option>{st.map(x => <option key={x.id} value={x.id}>{x.name}</option>)}</select></label>
+        <label className="entry-field"><span>Quantidade *</span><input type="number" min="1" placeholder="Ex.: 10" value={f.quantity} onChange={e => setF({ ...f, quantity: e.target.value })} /></label>
+        <label className="entry-field"><span>Preço unitário *</span><input type="number" min="0" step="0.01" placeholder="0,00" value={f.unit_price} onChange={e => setF({ ...f, unit_price: e.target.value })} /></label>
+        <label className="entry-field entry-notes"><span>Observação <small>Opcional</small></span><input placeholder="Detalhes úteis sobre este item" value={f.notes ?? ''} onChange={e => setF({ ...f, notes: e.target.value })} /></label>
+      </div>
+      <div className="entry-actions">{f.id && <button type="button" onClick={() => setF({ ...blank, store_id: f.store_id, entry_date: f.entry_date })}>Cancelar edição</button>}<button className="pri" onClick={save}>{f.id ? 'Salvar alterações' : 'Adicionar item'}</button></div>
+    </section>}
+    <section className="items-section"><div className="items-section-heading"><div><h3>Itens da lista</h3><p>Pesquise e filtre os itens registrados nesta lista.</p></div><div className="items-total"><span>{vis.reduce((a, x) => a + x.quantity, 0)} unidades</span><strong>{brl(vis.reduce((a, x) => a + +x.total, 0))}</strong></div></div>
+    <div className="item-filters"><label><span>Produto</span><input placeholder="Buscar na lista" value={fp} onChange={e => setFp(e.target.value)} /></label>
       <select value={fs} onChange={e => setFs(e.target.value)}><option value="">Todos fornecedores</option>{[...new Map(it.map(x => [x.supplier_id, x.suppliers.name]))].map(([id, n]: any) => <option key={id} value={id}>{n}</option>)}</select>
       <select value={fst} onChange={e => setFst(e.target.value)}><option value="">Todas lojas</option>{[...new Map(it.map(x => [x.store_id, x.stores.name]))].map(([id, n]: any) => <option key={id} value={id}>{n}</option>)}</select>
-      <input type="date" value={d1} onChange={e => setD1(e.target.value)} /><input type="date" value={d2} onChange={e => setD2(e.target.value)} />
-      <b>Qtd: {vis.reduce((a, x) => a + x.quantity, 0)} · Total: {brl(vis.reduce((a, x) => a + +x.total, 0))}</b>
-      {open && <button className="pri" disabled={!it.length} onClick={() => setPrev(true)}>Consolidar lista</button>}</div>
+      <label><span>De</span><input aria-label="Data inicial" type="date" value={d1} onChange={e => setD1(e.target.value)} /></label><label><span>Até</span><input aria-label="Data final" type="date" value={d2} onChange={e => setD2(e.target.value)} /></label>
+      {open && <button className="pri consolidate-button" disabled={!it.length} onClick={() => setPrev(true)}>Consolidar lista</button>}</div></section>
     {prev && <div className="card"><h3>Prévia da consolidação</h3><div className="tw"><table><thead><tr><th>Fornecedor</th><th>Loja</th><th>Produto</th><th>Qtd</th><th>Preço</th><th>Total</th></tr></thead>
       <tbody>{G.map((g, i) => <tr key={i}><td>{g.sup}</td><td>{g.store}</td><td>{g.p}</td><td>{g.q}</td><td>{brl(g.price)}</td><td>{brl(g.q * g.price)}</td></tr>)}</tbody></table></div>
       <p><b>{new Set(G.map(g => g.sup + g.store)).size} pedido(s) · {brl(G.reduce((a, g) => a + g.q * g.price, 0))}</b></p>
       <button className="pri" onClick={consolidate}>Confirmar</button> <button onClick={() => setPrev(false)}>Revisar</button></div>}
-    <div className="tw"><table><thead><tr><th>Data</th><th>Produto</th><th>Fornecedor</th><th>Loja</th><th>Qtd</th><th>Preço</th><th>Total</th><th>Obs.</th><th></th></tr></thead>
+    {vis.length ? <div className="tw item-table"><table><thead><tr><th>Data</th><th>Produto</th><th>Fornecedor</th><th>Loja</th><th>Qtd</th><th>Preço</th><th>Total</th><th>Obs.</th><th></th></tr></thead>
       <tbody>{vis.map(x => <tr key={x.id}><td>{dt(x.entry_date)}</td><td>{x.products.sku} - {x.products.description}</td><td>{x.suppliers.name}</td><td>{x.stores.name}</td><td>{x.quantity}</td><td>{brl(x.unit_price)}</td><td>{brl(x.total)}</td><td>{x.notes}</td>
-        <td>{open && <><button onClick={() => { setF({ ...x }); window.scrollTo(0, 0) }}>Editar</button> <button className="dan" onClick={async () => { if (confirm('Excluir lançamento?')) { await run(sb.from('purchase_list_items').delete().eq('id', x.id)); load() } }}>Excluir</button></>}</td></tr>)}</tbody></table></div></div>
+        <td>{open && <><button onClick={() => { setF({ ...x }); window.scrollTo(0, 0) }}>Editar</button> <button className="dan" onClick={async () => { if (confirm('Excluir lançamento?')) { await run(sb.from('purchase_list_items').delete().eq('id', x.id)); load() } }}>Excluir</button></>}</td></tr>)}</tbody></table></div> : <div className="items-empty"><span aria-hidden="true">＋</span><h3>{it.length ? 'Nenhum item encontrado' : 'Sua lista ainda está vazia'}</h3><p>{it.length ? 'Ajuste os filtros ou a busca para ver os itens.' : open ? 'Use o formulário acima para adicionar o primeiro produto.' : 'Esta lista foi consolidada sem itens visíveis.'}</p></div>}
+    </div>
 }
 
 function Orders({ admin }: any) {
